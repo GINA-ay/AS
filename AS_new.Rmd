@@ -1,0 +1,1337 @@
+---
+title: "AS"
+output: html_document
+date: "2024-11-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+
+```{r load packages}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(GEOquery)
+library(stringr) 
+library(limma)
+library(umap)
+library(edgeR)
+library(WGCNA)
+library(readxl)
+library(glmnet)
+library(caret)
+library(VennDiagram)
+library(grid)
+library(randomForest)
+library(rfPermute)
+library(RColorBrewer) 
+library(e1071)
+library(pROC)
+library(tidyverse)
+library(reshape2)
+library(CIBERSORT)
+library(pheatmap)
+library(ggpubr)
+```
+
+#1.DATA PREPRARAION
+
+```{r GEO EXTRACTION FUNCTION}
+process_geo_data <- function(gse_id) {
+  # DOWNLOAD DATA
+  gset <- getGEO(gse_id, 
+                 destdir = ".", 
+                 GSEMatrix = TRUE, 
+                 AnnotGPL = FALSE,
+                 getGPL = FALSE)
+  
+  # EXTRACTION
+  expr <- exprs(gset[[1]])
+  # CLINICAL INFO
+  pheno <- pData(phenoData(gset[[1]]))
+  
+  # RETURN
+  return(ExpressionSet(assayData = assayDataNew(exprs = expr),
+                      phenoData = AnnotatedDataFrame(pheno)))
+}
+```
+
+## (1) Bulk data
+
+```{r TRAIN DATA}
+AS_Train_num <- "GSE43292" # TRAIN GSE NUM
+AS_Train_data <- process_geo_data(AS_Train_num)
+
+# GENE INFO ANNOTATION
+Gpl<-read.table("D:/PROJECT/AS/Data/DATA PREPRARAION/43292_info.txt",
+                header = TRUE,fill = T,sep = "\t",
+                comment.char = "#",
+                stringsAsFactors = FALSE,
+                quote = "")
+
+# EXTRACT COLS
+
+ids=Gpl[,c("ID","gene_assignment")]
+
+# RENAME COLS
+colnames(ids)=c('probe_id','symbol')
+
+# EXTRACT GENE NAME
+ids$symbol=trimws(str_split(ids$symbol,'//',simplify = T)[,2])
+
+#
+ids=ids[ids$symbol != '',]
+#
+ids$probe_id = as.character(ids$probe_id)
+
+```
+
+
+```{r TEST DATA}
+AS_Test_num <- "GSE100927" # TEST GSE NUM
+AS_Test_data <- process_geo_data(AS_Test_num)
+
+# GENE INFO ANNOTATION
+Gpl2<-read.table("D:/PROJECT/AS/Data/DATA PREPRARAION/100927_info.txt",
+               header = TRUE,fill = T,sep = "\t",
+               comment.char = "#",
+               stringsAsFactors = FALSE,
+               quote = "")
+# EXTRACT COLS
+ids2=Gpl2[,c("ID","GENE_SYMBOL")]
+
+# RENAME COLS
+colnames(ids2)=c('probe_id','symbol')
+
+#
+ids2=ids2[ids2$symbol != '',]
+
+#
+ids2$probe_id = as.character(ids2$probe_id)
+
+
+```
+
+## (2) SINGLE CELL
+```{r SINGLE CELL}
+AS_sc_data<-Read10X("D:/PROJECT/AS/Data/DATA PREPRARAION/filtered_feature_bc_matrix")
+```
+
+
+#2. DATA PROCESSING
+
+## (1) SINGLE CELL
+
+```{r Seurat Object Creation}
+AS_sc<-CreateSeuratObject(counts = AS_sc_data,project="AS")
+```
+
+```{r parameters}
+mt_genes <- grep("^MT-", rownames(AS_sc), value = TRUE)
+AS_sc[["percent.mt"]] <- PercentageFeatureSet(AS_sc, features = mt_genes)
+nFeature_RNA_plot <- VlnPlot(AS_sc, features = "nFeature_RNA",cols = "pink")
+nCount_RNA_plot <- VlnPlot(AS_sc, features = "nCount_RNA",cols = "pink")
+percentmt_plot <- VlnPlot(AS_sc, features = "percent.mt",cols = "pink")
+```
+
+```{r QC}
+AS_sc <- subset(AS_sc,subset=nFeature_RNA<4000&nCount_RNA<20000&percent.mt<10)
+```
+
+```{r SAMPLE INFO}
+last_digits <- as.integer(substr(colnames(AS_sc), nchar(colnames(AS_sc)), nchar(colnames(AS_sc))))
+
+#
+AS_sc$orig.ident <- ifelse(last_digits %in% c(1, 3, 5), "PA", "AC")
+AS_sc$Individual <- ifelse(last_digits %in% c(1, 2), "Patient1",
+                          ifelse(last_digits %in% c(3, 4), "Patient2", "Patient3"))
+```
+
+```{r NOMALIZATION}
+AS_sc <- NormalizeData(AS_sc)
+AS_sc <- FindVariableFeatures(AS_sc)
+AS_sc <- ScaleData(AS_sc)
+```
+
+```{r}
+top10 <- head(VariableFeatures(AS_sc), 10)
+plot1 <- VariableFeaturePlot(AS_sc)+scale_color_manual(values = c("black", "pink"))
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+```
+
+
+```{r PCA&UMAP}
+AS_sc <- RunPCA(AS_sc) 
+AS_sc <- FindNeighbors(AS_sc,reduction="pca") 
+AS_sc <- FindClusters(AS_sc,cluster.name = "rna_clusters",resolution=0.4)
+AS_sc <- RunUMAP(AS_sc,dims = 1:30,reduction.name = "umap")
+```
+
+```{r}
+pcs <- ElbowPlot(AS_sc,ndims = 30)
+```
+
+```{r ANNOTATION}
+# 手动注释基因表达图
+Ecs_genes_plot <- FeaturePlot(AS_sc, features = c("VWF", "PECAM1", "ECSCR"),cols = c("grey", "pink"))
+All_Cells_plot <- DotPlot(AS_sc,features = c("VWF", "PECAM1", "ECSCR",'CD14','CD68','CALD1','MYL9','TAGLN','NKG7','XCL1','CTSW','CD2','TRAC','CD69','IGKC'),cols = c("grey", "pink"))+ theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+
+```{r ANNOTATION}
+#
+Idents(AS_sc)<-"rna_clusters"
+#
+new.cluster.ids<-c("NK cells","NK cells","VSMCs","Endothelial cells","Macrophages","Macrophages","Macrophages","VSMCs","B cells","Endothelial cells","VSMCs","VSMCs","Macrophages","B cells","NK cells","Macrophages","VSMCs")
+
+#
+names(new.cluster.ids)<-levels(AS_sc)
+#
+AS_sc<-RenameIdents(AS_sc,new.cluster.ids)
+#
+AS_sc$cell_type <- Idents(AS_sc)
+```
+
+```{r CLUSTERING}
+# 簇聚类
+clusters_uamp<-DimPlot(AS_sc, group.by="rna_clusters",label=TRUE,cols=c("orange", "pink", "red", "purple","orange","red", "lightpink", "lightpink", "darkorange", "salmon", "mediumvioletred", "pink", "purple", "pink", "purple", "mediumvioletred", "darkorange"))
+# 细胞类型聚类图
+Celltype_uamp<-DimPlot(AS_sc, group.by="cell_type",label=TRUE,cols=c("grey","grey","pink","grey","grey"))
+# 批次效应聚类图
+# 观察数据整合得好不,有没有混合在一起
+Individual_uamp<-DimPlot(AS_sc, group.by="Individual",label=TRUE,cols=c("orange", "pink", "mediumvioletred"))
+# 分组聚类图
+Group_uamp<-DimPlot(AS_sc, group.by="orig.ident",label=TRUE)
+
+```
+
+```{r CONDITION COMPARATION}
+group_cells <- AS_sc@meta.data %>%
+  as_tibble() %>%
+  dplyr::select(orig.ident, cell_type) %>%
+  group_by(orig.ident, cell_type) %>%
+  tally() %>%
+  ungroup()
+#
+group_cells_plot <- ggplot(group_cells, aes(x = orig.ident, y = n, fill = cell_type)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(x = "Group", y = "Number of Cells", fill = "Cell Type") +
+  theme_minimal() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),plot.background = element_rect(fill = "white"), panel.background = element_rect(fill = "white"))+
+  scale_fill_manual(values = c("red", "pink", "mediumvioletred", "salmon", "orange"))
+#
+group_cellspro_plot <- ggplot(group_cells, aes(x = orig.ident, y = n, fill = cell_type)) +
+  geom_bar(stat = "identity", position = "fill") + 
+  labs(x = "Group", y = "Proportion of Cells", fill = "Cell Type") +
+  theme_minimal() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+        plot.background = element_rect(fill = "white"), 
+        panel.background = element_rect(fill = "white")) +
+  scale_fill_manual(values = c("red", "pink", "mediumvioletred", "salmon", "orange"))
+
+#
+cluster_cells <- AS_sc@meta.data %>%
+  as_tibble() %>%
+  dplyr::select(rna_clusters, orig.ident) %>%
+  group_by(rna_clusters, orig.ident) %>%
+  tally() %>%
+  ungroup()
+cluster_cellspro_plot <- ggplot(cluster_cells, aes(x = rna_clusters, y = n, fill = orig.ident)) +
+  geom_bar(stat = "identity", position = "fill") + 
+  labs(x = "clusters", y = "Proportion of Cells", fill = "Group") +
+  theme_minimal() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+        plot.background = element_rect(fill = "white"), 
+        panel.background = element_rect(fill = "white"))+
+  scale_fill_manual(values = c("pink","grey"))
+```
+
+#
+```{r Ecs Markers}
+Idents(AS_sc) <- "cell_type"
+#
+ECs_Markers <- FindMarkers(AS_sc,ident.1 = "Endothelial cells")
+#
+ECs_Markers <- ECs_Markers %>% 
+  dplyr::filter(p_val<0.05 & abs(avg_log2FC) >3)
+```
+
+##（2）bulk RNA
+
+### Train
+```{r RENAME COUNTS ROWS}
+AS_Train_expr <- list(AS_Train_data@assayData$exprs)
+# 平台文件的ID和矩阵中的ID匹配。%in%用于判断是否匹配
+ids=ids[ids$probe_id %in% rownames(AS_Train_expr[[1]]),]
+
+# 获取匹配的表达数据
+AS_Train_expr <- AS_Train_expr[[1]][ids$probe_id,]
+
+# 合并
+AS_Train_expr<- cbind(ids,AS_Train_expr)
+
+# 删除空值行
+AS_Train_expr <- AS_Train_expr[!is.na(AS_Train_expr[, 2]) & AS_Train_expr[, 2] != "", ]
+
+# 删除重复基因，保留最大值
+AS_Train_expr<- aggregate( . ~ symbol,data=AS_Train_expr, max)
+
+# 一定注意看，是否需要删除几行
+View(AS_Train_expr)
+
+# 转化行名
+rownames(AS_Train_expr) <- AS_Train_expr[,1]
+
+# 删除第一二列
+AS_Train_expr <- AS_Train_expr[,-c(1,2)]
+```
+
+
+```{r RENAME COUNTS ROWS}
+# 导出修改过行名的表达谱
+write.table(data.frame(ID=rownames(AS_Train_expr),AS_Train_expr),file="D:/Project/AS/Data/DATA PROCESSING/GSE43292.txt", sep="\t", quote=F, row.names = F)
+
+```
+
+```{r EXTRACT SAMPLES INFO}
+GSE43292_sample_info <- AS_Train_data@phenoData@data
+
+#
+GSE43292_group_info <- data.frame(
+  sample_id = rownames(GSE43292_sample_info),
+  group = ifelse(grepl("Atheroma plaque", GSE43292_sample_info$`tissue:ch1`), "AS", "NC")
+)
+
+```
+
+
+#### a.DEG
+
+```{r edgeR DEG}
+# 
+Train_data<-read.table("D:/PROJECT/AS/Data/DATA PROCESSING/GSE43292.txt",header = TRUE,row.names = 1)
+
+# CONVERT TO edgeR OBJECT
+AS_edgeR <- DGEList(counts=Train_data,
+                    samples=GSE43292_group_info)
+
+# Create a design matrix
+AS_edgeR$samples$group<-relevel(factor(AS_edgeR$samples$group), ref = "NC")
+design <- model.matrix(~ group,AS_edgeR$samples)
+
+# DEG
+v <- voom(AS_edgeR, design)
+fit <- lmFit(v, design)
+fit <- eBayes(fit)
+all_DEG_genes<-topTable(fit, coef=2,number = Inf)
+
+# 
+significant_genes <- all_DEG_genes%>%
+  dplyr::filter(P.Value < 0.05 & abs(logFC) > 0.1)
+
+
+#
+positive_genes <- significant_genes%>%
+  dplyr::filter(logFC > 0)%>%
+  dplyr::arrange(desc(logFC))
+
+negative_genes <- significant_genes%>%
+  dplyr::filter(logFC < 0)%>%
+  dplyr::arrange(logFC)
+
+#
+top10_positive <- significant_genes[order(significant_genes$logFC, decreasing = TRUE), ][1:10, ]
+top10_negative <- significant_genes[order(significant_genes$logFC), ][1:10, ]
+
+
+```
+
+```{r volcano}
+volcano_plot <- ggplot(all_DEG_genes, aes(x = logFC, y = -log10(P.Value))) +
+  geom_point(alpha = 0.5, color = "grey") +
+  geom_point(data = significant_genes, aes(x = logFC, y = -log10(P.Value), color = ifelse(logFC > 0, "Upregulated", "Downregulated")), size = 2) +
+  geom_text_repel(data = rbind(top10_positive, top10_negative), aes(label = rownames(rbind(top10_positive, top10_negative))), size = 3, max.overlaps = Inf) +
+  scale_color_manual(values = c("Upregulated" = "pink", "Downregulated" = "black")) +
+  theme_minimal() +
+  labs(title = "Volcano Plot",
+       x = "Log Fold Change",
+       y = "-Log10 P-value",
+       color = "Regulation")
+#
+png("D:/PROJECT/AS/Plot/volcano_plot.png")
+volcano_plot
+dev.off()
+```
+
+```{r}
+
+top10_positive_expr <- AS_Train_expr[rownames(top10_positive), ]
+top10_negative_expr <- AS_Train_expr[rownames(top10_negative), ]
+
+# 合并这两个子集的表达数据
+combined_expr <- rbind(top10_positive_expr, top10_negative_expr)
+#
+combined_expr <- as.data.frame(sapply(combined_expr, as.numeric))
+combined_expr <- na.omit(combined_expr)
+#
+rownames(combined_expr) <- c(rownames(top10_positive_expr), rownames(top10_negative_expr))
+#
+combined_expr <- as.matrix(combined_expr)
+#
+annotation_col <- data.frame(Group = GSE43292_group_info$group)
+
+# 画热图
+heatmap <- pheatmap(combined_expr, 
+                    cluster_rows = TRUE,  
+                    cluster_cols = TRUE,
+                    scale = "row",
+                    color = colorRampPalette(c("black", "pink"))(100),
+                    main = "Top 10 Positive and Negative Genes Heatmap",
+                    annotation_col = annotation_col)
+
+#
+png("D:/PROJECT/AS/Plot/heatmap.png")
+heatmap
+dev.off()
+
+```
+
+#### b.WGCNA
+```{r}
+WGCNA <- read_xlsx("D:/PROJECT/AS/Data/DATA PROCESSING/hub_genes.xlsx")
+WGCNA_genes <- WGCNA$Gene
+```
+
+
+### TEST
+
+```{r RENAME COUNTS ROWS}
+AS_Test_expr <- list(AS_Test_data@assayData$exprs)
+# 平台文件的ID和矩阵中的ID匹配。%in%用于判断是否匹配
+ids2=ids2[ids2$probe_id %in% rownames(AS_Test_expr[[1]]),]
+
+# 获取匹配的表达数据
+AS_Test_expr <- AS_Test_expr[[1]][ids2$probe_id,]
+
+# 合并
+AS_Test_expr<- cbind(ids2,AS_Test_expr)
+
+# 删除空值行
+AS_Test_expr <- AS_Test_expr[!is.na(AS_Test_expr[, 2]) & AS_Test_expr[, 2] != "", ]
+
+# 删除重复基因，保留最大值
+AS_Test_expr<- aggregate( . ~ symbol,data=AS_Test_expr, max)
+
+# 一定注意看，是否需要删除几行
+View(AS_Test_expr)
+
+# 转化行名
+rownames(AS_Test_expr) <- AS_Test_expr[,1]
+
+# 删除第一二列
+AS_Test_expr <- AS_Test_expr[,-c(1,2)]
+
+```
+
+```{r EXTRACT SAMPLES INFO}
+GSE100927_sample_info <- AS_Test_data@phenoData@data
+#
+GSE100927_sample_info <-GSE100927_sample_info %>%
+  filter(grepl("carotid",source_name_ch1, ignore.case = TRUE))
+#
+GSE100927_group_info <- data.frame(
+  sample_id = rownames(GSE100927_sample_info),
+  group = ifelse(grepl("Atherosclerotic", GSE100927_sample_info$source_name_ch1), "AS", "NC")
+)
+
+#
+
+```
+
+```{r}
+AS_Test_expr<- AS_Test_expr[,GSE100927_group_info$sample_id]
+# 导出修改过的表达谱
+write.table(data.frame(ID=rownames(AS_Test_expr),AS_Test_expr),file="D:/Project/AS/Data/DATA PROCESSING/GSE100927.txt", sep="\t", quote=F, row.names = F)
+```
+
+
+# (3) PCD GENES
+
+```{r PCD GENES}
+pcd_genes<- read_xlsx("D:/PROJECT/AS/Data/DATA PROCESSING/PCD_GENES.xlsx")
+pcd_genes <- pcd_genes[,-1]
+
+pcd_genes <- unique(unlist(lapply(pcd_genes, function(col) {
+  na.omit(col)  # 去掉 NA 值
+}), use.names = FALSE))
+
+# 将结果转换为字符型列表
+pcd_genes <- as.character(pcd_genes)
+```
+
+# (4) 候选基因
+```{r intersection genes}
+#
+candidate_genes <- Reduce(intersect, list(rownames(ECs_Markers), pcd_genes, WGCNA_genes,rownames(significant_genes)))
+```
+
+
+```{r intersection genes}
+#
+write.table(candidate_genes,file="D:/Project/AS/Data/DATA PROCESSING/candidate_genes.txt", sep="\t", quote=F, row.names = T)
+```
+
+# (5) 提取基因表达矩阵
+```{r}
+selected_exp <- Train_data[ as.character(candidate_genes),]
+```
+
+
+```{r}
+write.csv(selected_exp,file="D:/Project/AS/Data/DATA PROCESSING/ml_genes.csv")
+```
+
+# 3. GO,KEGG富集分析
+```{r}
+#
+```
+
+
+# 4. PPI蛋白
+```{r}
+#
+```
+
+
+# 5.MACHINE LEARNING
+```{r}
+setwd("D:/Project")
+source('./msvmRFE.R')
+```
+
+```{r ML DATA PREPARE}
+#
+ml_data <- read.csv("D:/Project/AS/Data/DATA PROCESSING/ml_genes.csv",row.names = 1)
+ml_data=as.data.frame(t(ml_data))
+
+#
+Group=GSE43292_group_info$group
+
+#
+ml_data=cbind(Group,ml_data)
+
+#
+ml_data$Group=as.numeric(ifelse(ml_data$Group == "NC", 0,1))
+
+#
+train = ml_data
+
+#
+x <- as.matrix(train[,-1])
+
+#
+y <- train$Group
+```
+
+
+
+## (1) LASSO
+
+```{r LASSO}
+# FIT MODEL
+fit_lasso = glmnet(x, y, family = "binomial", alpha = 1, lambda = NULL)
+png("D:/Project/AS/plot/ML/lasso.png")
+plot(fit_lasso, xvar = "dev", label = TRUE)
+dev.off()
+
+# CROSS VALIDATION
+cvfit = cv.glmnet(x, y,
+                  nfold=10, 
+                  family = "binomial", type.measure = "class")
+				  
+# RESULT OUTPUT				  
+png("D:/Project/AS/plot/ML/cvfit.png")
+plot(cvfit)
+dev.off()
+
+# SELECT THE BEST PARAMETER
+cvfit$lambda.min
+myCoefs <- coef(cvfit, s="lambda.min")
+
+# SELECT FEATURES
+lasso_feature <- myCoefs@Dimnames[[1]][which(myCoefs != 0 )]
+lasso_feature <- lasso_feature[-1] 
+lasso_feature <- as.data.frame(lasso_feature)
+colnames(lasso_feature)="gene"
+
+# OUTPUT
+write.csv(lasso_feature,"D:/Project/AS/Data/ML/select_feature_lasso.csv",row.names=FALSE)
+```
+
+
+## (2) SVM
+```{r FIT SVM}
+# input
+input=ml_data
+
+# set random 
+set.seed(123)
+nfold = 10
+nrows = nrow(input)
+folds = rep(1:nfold, len=nrows)[sample(nrows)]
+folds = lapply(1:nfold, function(x) which(folds == x))
+
+# SVM features
+results = lapply(folds, svmRFE.wrap, input, k=3, halve.above=3)
+#
+SVM_features = WriteFeatures(results, input, save=F)
+```
+
+
+```{r SVM TEST}
+# 测试不同数量特征的性能
+featsweep = lapply(1:23, FeatSweep.wrap, results, input)
+# 计算基线错误率
+no.info = min(prop.table(table(input[,1])))
+# 提取每个特征数量对应的错误率
+errors = sapply(featsweep, function(x) ifelse(is.null(x), NA, x$error))
+
+# 绘制错误率曲线
+png("D:/Project/AS/plot/ML/svm_error.png")
+PlotErrors(errors, no.info=no.info)
+dev.off()
+
+# 绘制准确率曲线
+png("D:/Project/AS/plot/ML/svm-accuracy.png")
+Plotaccuracy(1-errors,no.info=no.info) 
+dev.off()
+```
+
+
+```{r SVM FEATURES}
+# 选择错误率最小时对应的特征
+svm_selected=as.data.frame(SVM_features[1:which.min(errors),"FeatureName"])
+colnames(svm_selected)="gene"
+# 保存结果
+write.csv(svm_selected,"D:/Project/AS/Data/ML/select_feature_svm.csv",row.names=FALSE)
+```
+
+
+
+
+## (3) RANDOM FOREST
+```{r FIT RANDOM FOREST}
+#SET RANDOM
+set.seed(123)
+
+#
+df.rf <- rfPermute(Group ~ ., data = ml_data, 
+                         ntree = 1000,
+                         nrep = 299, 
+                         num.cores = 2)
+
+rf.data <- data.frame(importance(df.rf, decreasing = F))
+
+
+
+rf.data <- mutate(rf.data,
+  label = ifelse(X.IncMSE.pval < 0.001, '***',
+                 ifelse(X.IncMSE.pval < 0.01, '**',
+                        ifelse(X.IncMSE.pval < 0.05, '*', ''))))
+
+
+rf.data$name <- rownames(rf.data)
+
+rf.data$name <- factor(rf.data$name,
+                         levels = rf.data$name)
+```
+
+
+```{r RANDOM FOREST}
+png("D:/Project/AS/plot/ML/RF_importance.png")
+p <- ggplot(rf.data, aes(name, X.IncMSE)) +
+  geom_bar(aes(fill = label),
+           stat = 'identity') +
+  scale_fill_manual(values = brewer.pal(6,"Accent")) +
+  geom_text(aes(y = X.IncMSE + 0.5,
+                label = label)) +
+  theme_classic() +
+  labs(x = '',y = 'Increase in MSE(%)') +
+  theme(legend.position = '',axis.text.y=element_text(size=7)) +
+  coord_flip() 
+print(p)
+dev.off()
+```
+
+
+```{r RANDOM FOREST FEATURES}
+rf.data.sig <- rf.data[which(rf.data$label != ""),]
+rf.data.sig.gene=as.data.frame(rf.data.sig$name)
+colnames(rf.data.sig.gene)="gene"
+write.csv(rf.data.sig.gene,"D:/Project/AS/Data/ML/select_feature_randomForest.csv",row.names=FALSE)
+```
+
+
+## (4) ML GENES
+```{r INTERSECT GENES}
+ML_markers <- Reduce(intersect, list(rf.data.sig.gene$gene, svm_selected$gene, lasso_feature$gene))
+```
+
+## (5) validation
+```{r DATA FILTERING}
+#
+test_data <- AS_Test_expr
+test_data=as.data.frame(t(test_data))
+
+#
+Group=GSE100927_group_info$group
+
+#
+test_data=cbind(Group,test_data)
+
+#
+test_data$Group=as.numeric(ifelse(test_data$Group == "NC", 0,1))
+
+#filter
+test <- subset(test_data, select = ML_markers)
+test=cbind(Group,test)
+
+#
+test_expression<- melt(test, id.vars = "Group", 
+                       variable.name = "Gene", value.name = "Expression")
+
+
+
+#filter
+train_filter <- subset(train, select = ML_markers)
+Group=train$Group
+train_filter=cbind(Group,train_filter)
+train_filter$Group=as.character(ifelse(train_filter$Group == 0,"NC","AS"))
+#
+train_expression <- Train_data[ML_markers,]
+#
+train_forv<- melt(train_filter, id.vars = "Group", 
+                        variable.name = "Gene", 
+                        value.name = "Expression")
+#
+write.csv(train_expression,"D:/Project/AS/Data/train_expression.csv",row.names=TRUE)
+write.csv(train_forv,"D:/Project/AS/Data/train_expression_forva.csv",row.names=TRUE)
+write.csv(train_filter,"D:/Project/AS/Data/genes_group.csv",row.names=TRUE)
+write.csv(test_expression,"D:/Project/AS/Data/test_expression_forva.csv",row.names=TRUE)
+write.csv(test,"D:/Project/AS/Data/test.csv",row.names=TRUE)
+
+```
+
+# 6. MR
+```{r}
+library(VariantAnnotation)
+library(gwasvcf)
+library(gwasglue)
+library(TwoSampleMR)
+```
+
+
+```{r}
+
+exposure_NLRP3 <- VariantAnnotation::readVcf("D:/PROJECT/AS/Data/MR/NLRP3_VCF.vcf")
+class(exposure_NLRP3)
+head(exposure_NLRP3)
+dim(exposure_NLRP3)
+#
+exposure_NLRP3_filtered <- query_gwas(vcf=exposure_NLRP3,pval=0.05)
+head(exposure_NLRP3_filtered)
+dim(exposure_NLRP3_filtered)
+#
+exposure_NLRP3_MR <- gwasvcf_to_TwoSampleMR(vcf=exposure_NLRP3_filtered)
+exposure_NLRP3_MR=exposure_NLRP3_MR[1:20,]
+colnames(exposure_NLRP3_MR)
+head(exposure_NLRP3_MR)
+dim(exposure_NLRP3_MR)
+
+```
+
+
+```{r}
+
+exposure_RAC2 <- VariantAnnotation::readVcf("D:/PROJECT/AS/Data/MR/RAC2_VCF.vcf")
+class(exposure_RAC2)
+head(exposure_RAC2)
+dim(exposure_RAC2)
+#
+exposure_RAC2_filtered <- query_gwas(vcf=exposure_RAC2,pval=0.05)
+head(exposure_RAC2_filtered)
+dim(exposure_RAC2_filtered)
+#
+exposure_RAC2_MR <- gwasvcf_to_TwoSampleMR(vcf=exposure_RAC2_filtered)
+exposure_RAC2_MR=exposure_RAC2_MR[1:20,]
+colnames(exposure_RAC2_MR)
+head(exposure_RAC2_MR)
+dim(exposure_RAC2_MR)
+
+```
+
+
+```{r}
+
+exposure_PIM2 <- VariantAnnotation::readVcf("D:/PROJECT/AS/Data/MR/PIM2_VCF.vcf")
+class(exposure_PIM2)
+head(exposure_PIM2)
+dim(exposure_PIM2)
+#
+exposure_PIM2_filtered <- query_gwas(vcf=exposure_PIM2,pval=0.05)
+head(exposure_PIM2_filtered)
+dim(exposure_PIM2_filtered)
+#
+exposure_PIM2_MR <- gwasvcf_to_TwoSampleMR(vcf=exposure_PIM2_filtered)
+exposure_PIM2_MR=exposure_PIM2_MR[1:20,]
+colnames(exposure_PIM2_MR)
+head(exposure_PIM2_MR)
+dim(exposure_PIM2_MR)
+
+```
+
+
+```{r}
+outcome_MR <- read_outcome_data(
+							  filename = "D:/PROJECT/AS/Data/MR/finngen_R11_I9_CORATHER.gz",
+							  sep = "\t",
+							  snp_col = "rsids",
+							  beta_col = "beta",
+							  se_col = "sebeta",
+							  effect_allele_col = "alt",
+							  other_allele_col = "ref",
+							  eaf_col = "af_alt",
+							  pval_col = "pval",
+							  min_pva=5e-20,
+							  samplesize_col = "samplesize")
+
+head(outcome_MR)
+colnames(outcome_MR)
+dim(outcome_MR)
+
+```
+
+
+```{r NLRP3_MR}
+harm_rt <- harmonise_data(exposure_dat = exposure_NLRP3_MR , outcome_dat = outcome_MR,action=2)
+
+#
+harm_rt$R2 <- (2 * (harm_rt$beta.exposure^2) * harm_rt$eaf.exposure * (1 - harm_rt$eaf.exposure)) /
+(2 * (harm_rt$beta.exposure^2) * harm_rt$eaf.exposure * (1 - harm_rt$eaf.exposure) +
+   2 * harm_rt$samplesize.exposure*harm_rt$eaf.exposure * (1 - harm_rt$eaf.exposure) * harm_rt$se.exposure^2)
+	   
+#  
+harm_rt$f <- harm_rt$R2 * (harm_rt$samplesize.exposure - 2) / (1 - harm_rt$R2)
+harm_rt$meanf<- mean( harm_rt$f)
+harm_rt<-harm_rt[harm_rt$f>8,]
+head(harm_rt)
+#
+mr_result<- mr(harm_rt)
+head(mr_result)
+#
+result_or=generate_odds_ratios(mr_result) 
+head(result_or)
+write.table(harm_rt, file ="D:/PROJECT/AS/Data/MR/harmonise_NLRP3.txt",row.names = F,sep = "\t",quote = F)
+write.table(result_or[,5:ncol(result_or)],file ="D:/PROJECT/AS/Data/MR/OR.txt",row.names = F,sep = "\t",quote = F)
+#
+pleiotropy=mr_pleiotropy_test(harm_rt)
+write.table(pleiotropy,file = "D:/PROJECT/AS/Data/MR/pleiotropy_NLRP3.txt",sep = "\t",quote = F)
+#
+heterogeneity=mr_heterogeneity(harm_rt)
+write.table(heterogeneity,file = "D:/PROJECT/AS/Data/MR/heterogeneity_NLRP3.txt",sep = "\t",quote = F)
+
+#
+p1 <- mr_scatter_plot(mr_result, harm_rt)
+ggsave(p1[[1]], file="D:/PROJECT/AS/Plot/MR/scatter_NLRP3.png")
+
+#
+singlesnp_res<- mr_singlesnp(harm_rt)
+singlesnpOR=generate_odds_ratios(singlesnp_res)
+write.table(singlesnpOR,file="D:/PROJECT/AS/Data/MR/singlesnpOR_NLRP3.txt",row.names = F,sep = "\t",quote = F)
+#
+p2 <- mr_forest_plot(singlesnp_res)
+ggsave(p2[[1]], file="D:/PROJECT/AS/Plot/MR/forest_NLRP3.png")
+#
+sen_res<- mr_leaveoneout(harm_rt)
+p3 <- mr_leaveoneout_plot(sen_res)
+ggsave(p3[[1]], file="D:/PROJECT/AS/Plot/MR/sensitivity-analysis_NLRP3.png")
+#
+res_single <- mr_singlesnp(harm_rt)
+p4 <- mr_funnel_plot(singlesnp_res)
+ggsave(p4[[1]], file="D:/PROJECT/AS/Plot/MR/funnelplot_NLRP3.png")
+#
+presso=run_mr_presso(harm_rt,NbDistribution = 1000)
+capture.output(presso,file = "D:/PROJECT/AS/Data/MR/presso_NLRP3.txt")
+```
+
+
+```{r RAC2_MR}
+harm_rt <- harmonise_data(exposure_dat = exposure_RAC2_MR , outcome_dat = outcome_MR,action=2)
+#
+harm_rt$R2 <- (2 * (harm_rt$beta.exposure^2) * harm_rt$eaf.exposure * (1 - harm_rt$eaf.exposure)) /
+(2 * (harm_rt$beta.exposure^2) * harm_rt$eaf.exposure * (1 - harm_rt$eaf.exposure) +
+   2 * harm_rt$samplesize.exposure*harm_rt$eaf.exposure * (1 - harm_rt$eaf.exposure) * harm_rt$se.exposure^2)
+	   
+	   
+harm_rt$f <- harm_rt$R2 * (harm_rt$samplesize.exposure - 2) / (1 - harm_rt$R2)
+harm_rt$meanf<- mean( harm_rt$f)
+harm_rt<-harm_rt[harm_rt$f>8,]
+head(harm_rt)
+#
+mr_result<- mr(harm_rt)
+head(mr_result)
+
+result_or=generate_odds_ratios(mr_result) 
+head(result_or)
+#
+write.table(harm_rt, file ="D:/PROJECT/AS/Data/MR/harmonise_RAC2.txt",row.names = F,sep = "\t",quote = F)
+write.table(result_or[,5:ncol(result_or)],file ="D:/PROJECT/AS/Data/MR/OR_RAC2.txt",row.names = F,sep = "\t",quote = F)
+pleiotropy=mr_pleiotropy_test(harm_rt)
+write.table(pleiotropy,file = "D:/PROJECT/AS/Data/MR/pleiotropy_RAC2.txt",sep = "\t",quote = F)
+heterogeneity=mr_heterogeneity(harm_rt)
+write.table(heterogeneity,file = "D:/PROJECT/AS/Data/MR/heterogeneity_RAC2.txt",sep = "\t",quote = F)
+#
+p1 <- mr_scatter_plot(mr_result, harm_rt)
+ggsave(p1[[1]], file="D:/PROJECT/AS/Plot/MR/scatter_RAC2.png")
+#
+singlesnp_res<- mr_singlesnp(harm_rt)
+singlesnpOR=generate_odds_ratios(singlesnp_res)
+write.table(singlesnpOR,file="D:/PROJECT/AS/Data/MR/singlesnpOR_RAC2.txt",row.names = F,sep = "\t",quote = F)
+#
+p2 <- mr_forest_plot(singlesnp_res)
+ggsave(p2[[1]], file="D:/PROJECT/AS/Plot/MR/forest_RAC2.png")
+#
+sen_res<- mr_leaveoneout(harm_rt)
+p3 <- mr_leaveoneout_plot(sen_res)
+ggsave(p3[[1]], file="D:/PROJECT/AS/Plot/MR/sensitivity-analysis_RAC2.png")
+res_single <- mr_singlesnp(harm_rt)
+p4 <- mr_funnel_plot(singlesnp_res)
+ggsave(p4[[1]], file="D:/PROJECT/AS/Plot/MR/funnelplot_RAC2.png")
+#
+presso=run_mr_presso(harm_rt,NbDistribution = 1000)
+capture.output(presso,file = "D:/PROJECT/AS/Data/MR/presso_RAC2.txt")
+```
+
+```{r PIM2_MR}
+harm_rt <- harmonise_data(exposure_dat = exposure_PIM2_MR , outcome_dat = outcome_MR,action=2)
+#
+harm_rt$R2 <- (2 * (harm_rt$beta.exposure^2) * harm_rt$eaf.exposure * (1 - harm_rt$eaf.exposure)) /
+(2 * (harm_rt$beta.exposure^2) * harm_rt$eaf.exposure * (1 - harm_rt$eaf.exposure) +
+   2 * harm_rt$samplesize.exposure*harm_rt$eaf.exposure * (1 - harm_rt$eaf.exposure) * harm_rt$se.exposure^2)
+	   
+	   
+harm_rt$f <- harm_rt$R2 * (harm_rt$samplesize.exposure - 2) / (1 - harm_rt$R2)
+harm_rt$meanf<- mean( harm_rt$f)
+harm_rt<-harm_rt[harm_rt$f>8,]
+head(harm_rt)
+
+mr_result<- mr(harm_rt)
+head(mr_result)
+
+result_or=generate_odds_ratios(mr_result) 
+head(result_or)
+#
+write.table(harm_rt, file ="D:/PROJECT/AS/Data/MR/harmonise_PIM2.txt",row.names = F,sep = "\t",quote = F)
+write.table(result_or[,5:ncol(result_or)],file ="D:/PROJECT/AS/Data/MR/OR_PIM2.txt",row.names = F,sep = "\t",quote = F)
+pleiotropy=mr_pleiotropy_test(harm_rt)
+write.table(pleiotropy,file = "D:/PROJECT/AS/Data/MR/pleiotropy_PIM2.txt",sep = "\t",quote = F)
+heterogeneity=mr_heterogeneity(harm_rt)
+write.table(heterogeneity,file = "D:/PROJECT/AS/Data/MR/heterogeneity_PIM2.txt",sep = "\t",quote = F)
+#
+p1 <- mr_scatter_plot(mr_result, harm_rt)
+ggsave(p1[[1]], file="D:/PROJECT/AS/Plot/MR/scatter_PIM2.png")
+#
+singlesnp_res<- mr_singlesnp(harm_rt)
+singlesnpOR=generate_odds_ratios(singlesnp_res)
+write.table(singlesnpOR,file="D:/PROJECT/AS/Data/MR/singlesnpOR_PIM2.txt",row.names = F,sep = "\t",quote = F)
+#
+p2 <- mr_forest_plot(singlesnp_res)
+ggsave(p2[[1]], file="D:/PROJECT/AS/Plot/MR/forest_PIM2.png")
+#
+sen_res<- mr_leaveoneout(harm_rt)
+p3 <- mr_leaveoneout_plot(sen_res)
+ggsave(p3[[1]], file="D:/PROJECT/AS/Plot/MR/sensitivity-analysis_PIM2.png")
+#
+res_single <- mr_singlesnp(harm_rt)
+p4 <- mr_funnel_plot(singlesnp_res)
+ggsave(p4[[1]], file="D:/PROJECT/AS/Plot/MR/funnelplot_PIM2.png")
+#
+presso=run_mr_presso(harm_rt,NbDistribution = 1000)
+capture.output(presso,file = "D:/PROJECT/AS/Data/MR/presso_PIM2.txt")
+```
+
+
+# 7. ceRNA
+```{r ceRNA}
+#nodeSource dataframe
+nodeSource=read.table("D:/Project/AS/Data/nodeSource.txt",header=T,sep="\t",check.names=FALSE)
+
+#node dataframe
+node=read.table("D:/Project/AS/Data/node.txt",header=T,sep="\t",check.names=FALSE)
+
+#node1
+sourceTarget1=NULL
+for(i in 1:length(node$node1)){
+     temp=NULL
+     loc=NULL
+     loc=match(node$node1[i],nodeSource$node)
+	 temp=cbind(node$node1[i],nodeSource$name[loc])
+	 sourceTarget1=rbind(sourceTarget1,temp)
+     
+}
+
+sourceTarget1=as.data.frame(sourceTarget1)
+colnames(sourceTarget1)=c("node1","name1")
+
+#node2
+sourceTarget2=NULL
+for(i in 1:length(node$node2)){
+     temp=NULL
+     loc=NULL
+     loc=match(node$node2[i],nodeSource$node)
+	 temp=cbind(node$node2[i],nodeSource$name[loc])
+	 sourceTarget2=rbind(sourceTarget2,temp)
+     
+}
+
+sourceTarget2=as.data.frame(sourceTarget2)
+colnames(sourceTarget2)=c("node1","name2")
+
+
+#combination
+finalSourceTarget=data.frame(source=sourceTarget1$name1,target=sourceTarget2$name2)
+
+#
+write.table(finalSourceTarget,"D:/Project/AS/Data/finalSourceTarget.txt",sep="\t",quote=FALSE,row.names=FALSE)
+```
+
+# 8. 免疫浸润
+
+```{r}
+source("D:/Project/CIBERSORT.R")
+```
+
+```{r}
+expFile="D:/PROJECT/AS/Data/GSE43292.txt"     
+rt=read.table(expFile, header=T,check.names=FALSE)
+
+#
+rt=as.matrix(rt)
+rownames(rt)=rt[,1]
+exp=rt[,2:ncol(rt)]
+dimnames=list(rownames(exp),colnames(exp))
+data=matrix(as.numeric(as.matrix(exp)),nrow=nrow(exp),dimnames=dimnames)
+data=avereps(data)
+
+#
+v=voom(data, plot=F, save.plot=F)
+out=v$E
+out=rbind(ID=colnames(out), out)
+write.table(out,file="D:/PROJECT/AS/Data/uniq.symbol.txt",sep="\t",quote=F,col.names=F)
+
+#
+ciber <- cibersort(sig_matrix = "D:/PROJECT/AS/Data/ref.txt",
+                   mixture_file = "D:/PROJECT/AS/Data/uniq.symbol.txt",
+                   perm = 10,
+                   QN = TRUE)
+
+
+write.csv(ciber,"D:/PROJECT/AS/Data/CIBERSORT_Results.csv")
+
+```
+
+
+## 相关性分析
+```{r Corr between genes and immune cells}
+library(psych)
+#
+dat2=read.table("D:/PROJECT/AS/Data/cells.txt",header=T,check.names=FALSE,sep="\t",row.names=1)
+dat1=read.table("D:/PROJECT/AS/Data/genes.txt",header=T,check.names=FALSE,sep="\t",row.names=1)
+#
+res <- corr.test(dat1, 
+                 dat2, 
+				 #use = "pairwise", 
+				 method = "spearman", 
+				 adjust = "holm", 
+				 alpha = 0.05)
+				 
+				 
+pmt <- res$p
+cmt <- res$r
+#
+write.csv(pmt, "D:/PROJECT/AS/Data/cor.p.csv")
+write.csv(cmt, "D:/PROJECT/AS/Data/cor.r.csv")
+
+#
+if (!is.null(pmt)) {
+  ssmt <- pmt < 0.01
+  pmt[ssmt] <- '**'
+  smt <- pmt > 0.01 & pmt < 0.05
+  pmt[smt] <- '*'
+  pmt[!ssmt & !smt] <- ''
+} else {
+  pmt <- FALSE
+}
+
+library(RColorBrewer)
+
+bcolors <- brewer.pal(9, "Set1")[3:5]
+
+my_col <- colorRampPalette(rev(brewer.pal(7, "RdBu")))(200)
+
+library(pheatmap)
+
+p1 <- pheatmap(cmt, scale = "none",
+					 cluster_row = FALSE,
+					 cluster_col = FALSE,
+					 border = NA,
+					 display_numbers = pmt,
+					 fontsize_number = 10,
+					 number_color = "black",
+					 cellwidth = 30,
+					 cellheight = 50,
+					 color = my_col,
+					 angle_col = 45,
+					 fontsize_row = 13,
+					 fontsize_col = 13
+					 )
+
+
+ggsave("D:/PROJECT/AS/Plot/towMatrixCor.pdf",p1,width=18,height=8)
+
+```
+
+
+```{r Corr }
+library(corrplot)
+#
+obj <- read.table("D:/PROJECT/AS/Data/CIBERSORT.txt",header=T,sep="\t",check.names=FALSE,row.names=1)
+corv <- cor(obj)
+write.csv(corv,"D:/PROJECT/AS/Data/CIBERSORT_Results_corR.csv")
+#
+pmat <- cor.mtest(obj)
+write.csv(pmat,"D:/PROJECT/AS/Data/CIBERSORT_Results_corP.csv")
+```
+
+
+```{r Corr }
+
+my_col <- colorRampPalette(rev(brewer.pal(7, "RdBu")))(200)
+
+pdf("D:/PROJECT/AS/Plot/cell_cor.pdf",width=8,height=8)
+corrplot(corv, 
+             p.mat = pmat$p, 
+			 method = 'color', 
+			 diag = TRUE, 
+			 type = 'lower', #full,upper,lower
+             sig.level = c(0.001, 0.01, 0.05), 
+			 pch.cex = 0.8,
+		     insig = 'label_sig', 
+			 order = 'hclust', 
+			 tl.col = "black", 
+			 tl.cex = 1.2, 
+			 col = my_col)
+
+dev.off()
+
+```
+
+```{r}
+#
+obj$RowNames <- rownames(obj)
+
+#
+melt.data <- melt(obj, id.vars = "RowNames")
+
+#
+head(melt.data)
+
+#
+colnames(melt.data) <- c("sample", "cellType", "value")
+
+#
+write.csv(melt.data,"D:/PROJECT/AS/Data/immune_por.csv")
+```
+
+
+```{r}
+colnames(melt.data) <- c("sample", "cellType", "value")
+
+#
+mycolours <- c(brewer.pal(12, "Paired"), brewer.pal(8, "Dark2"), brewer.pal(12, "Set3"))
+
+#
+p <- ggplot(melt.data, aes(x = sample, y = value, fill = cellType)) +
+				  geom_bar(stat = "identity", position = 'fill') +
+				  scale_fill_manual(values = mycolours) +
+				  theme_bw() +
+				  theme(axis.text = element_text(colour = 'black', size = 12),  
+						axis.text.x = element_blank(),  
+						panel.grid = element_blank(),
+						axis.title.x = element_text(size = 14),  
+						axis.title.y = element_text(size = 14),  
+						legend.text = element_text(size = 14),  
+						legend.title = element_text(size = 15)) +  
+				  guides(fill = guide_legend(ncol = 1)) +  
+				  labs(x = "sample", y = "cell ratio") +
+				  scale_y_continuous(expand = c(0, 0))
+
+ggsave("D:/PROJECT/AS/Plot/ratio.pdf", p, width = 12, height = 6)
+
+```
+
+
+```{r 免疫细胞各组比例分析}
+
+obj <- read.csv("D:/PROJECT/AS/Data/CIBERSORT_group.csv")
+melt.dat = melt(obj)
+head(melt.dat)
+colnames(melt.dat)=c("Sample","Group","Celltype","Composition")
+plot_order = melt.dat %>% 
+					  group_by(Celltype) %>% 
+					  summarise(m = median(Composition)) %>% 
+					  arrange(desc(m)) %>% 
+					  pull(Celltype)
+
+
+melt.dat$Celltype = factor(melt.dat$Celltype,levels = plot_order)
+
+library(ggplot2)
+mytheme <- theme(plot.title = element_text(size = 12,color="black",hjust = 0.5),
+                 axis.title = element_text(size = 12,color ="black"), 
+                 axis.text = element_text(size= 12,color = "black"),
+                 panel.grid.minor.y = element_blank(),
+                 panel.grid.minor.x = element_blank(),
+                 axis.text.x = element_text(angle = 45, hjust = 1 ),
+                 panel.grid=element_blank(),
+                 legend.position = "top",
+                 legend.text = element_text(size= 12),
+                 legend.title= element_text(size= 14))
+
+
+
+
+mycolours <- c("#9B59B6", "#F39C12") 
+p <- ggplot(melt.dat, aes(x = Celltype, y = Composition))+ 
+			  labs(y="Cell composition",x= NULL,title = "")+  
+			  geom_boxplot(aes(fill = Group),position=position_dodge(0.5),width=0.5,outlier.alpha = 0)+ 
+			  scale_fill_manual(values = mycolours)+
+			  theme_classic() + mytheme + 
+			  stat_compare_means(aes(group =  Group),
+								 label = "p.signif",
+								 method = "wilcox.test",
+								 hide.ns = T)
+
+
+ggsave("D:/PROJECT/AS/Plot/cell.Diff.pdf",p,width=10,height=6)
+
+```
+
+# 9.列线图
+```{r}
+library(rmda)
+library(rms)
+library(survival)
+```
+
+```{r}
+TrainData=read.csv("D:/PROJECT/AS/Data/genes_group.csv",header=T,check.names=FALSE,row.names=1)
+#
+
+```
+
+```{r}
+dt=read.csv("nomoData.csv",row.names=1,check.names=FALSE,header=T)
+dt=na.omit(dt)
+
+
+
+library(rms)
+ddist <- datadist(dt)
+options(datadist='ddist')
+
+
+#Manually add
+preVariable="group"
+#
+allColnms=colnames(dt)
+colnms=allColnms[!allColnms %in% preVariable]
+formulaStr=paste(colnms,collapse=" + ")
+modelFormula=as.formula(paste(preVariable, " ~ ",formulaStr))
+
+model <- lrm(modelFormula, data = dt,x=TRUE,y=TRUE,tol=1e-9,maxit=1000)
+
+nomogram <- nomogram(model, 
+                     fun = function(x) 1 / (1 + exp(-x)),
+                     fun.at = c(0.05,seq(0.1,0.9,by=0.1),0.95),
+                     lp.at = seq(-8, 8, by = 2),
+                     fun.lp.at = seq(-8, 8, by = 2), 
+                     maxscale = 100)
+
+nomogram$"Predicted Value"$fat=round(as.numeric(nomogram$"Predicted Value"$fat),3)
+
+
+
+
+pdf("Nomogram.pdf")
+plot(nomogram)
+dev.off()
+
+
+
+
+
+
+
+
+
+
+cal<-calibrate(model,data = dt)
+
+
+pdf("calibration.pdf")
+plot(cal,
+     xlim=c(0,1.0),ylim=c(0,1.0),
+     xlab = "Predicted Probability",
+     ylab = "Observed Probability"
+)
+dev.off()
+
+
+
+
+
+
+
+```
+
+
+```{r}
+Train=decision_curve(Group ~ NLRP3 + RAC2 + PIM2,
+                     data=TrainData,
+                     study.design="case-control",
+                     bootstraps=50)
+summary(Train)
+```
+
+
+```{r}
+
+png("D:/PROJECT/AS/Plot/Train_decisionCurve.png")
+plot_decision_curve(Train,
+                    curve.names="Train",
+                    cost.benefit.axis=F,
+                    confidence.intervals="none")
+dev.off()
+
+```
+
+
+
+
